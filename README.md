@@ -7,13 +7,13 @@
 Install by (NOTE: it requires go 1.21rc3 and above):
 
 ```sh
-go install go.yhsif.com/ddporkbun
+go install go.yhsif.com/ddporkbun@latest
 ```
 
 Run manually to update `dyndns.mydomain.com` with your current external IP:
 
 ```sh
-ddporkbun --apikey="..." --secretapikey="..." --domain="mydomain.com" --subdomain="dyndns"
+ddporkbun --apikey="pk1_..." --secretapikey="sk1_..." --domain="mydomain.com" --subdomain="dyndns"
 ```
 
 To run it in cron jobs, for example `cron.hourly`, it's recommended to add
@@ -22,7 +22,7 @@ To run it in cron jobs, for example `cron.hourly`, it's recommended to add
 ```sh
 #!/bin/sh
 
-/path/to/ddporkbun --apikey="..." --secretapikey="..." --domain="mydomain.com" --subdomain="dyndns" --log-level=ERROR
+/path/to/ddporkbun --apikey="pk1_..." --secretapikey="sk1_..." --domain="mydomain.com" --subdomain="dyndns" --log-level=ERROR
 ```
 
 Run `ddporkbun --help` to see all options.
