@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -86,6 +87,17 @@ func main() {
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
 		AddSource: true,
 		Level:     &level,
+		ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
+			if req, ok := a.Value.Any().(request); ok {
+				req.SecKey = "*REDACTED*"
+
+				var sb strings.Builder
+				if err := json.NewEncoder(&sb).Encode(req); err == nil {
+					a.Value = slog.StringValue(sb.String())
+				}
+			}
+			return a
+		},
 	})))
 
 	ctx := context.Background()
@@ -170,7 +182,7 @@ func getIP(ctx context.Context) string {
 			"Failed to generate http request",
 			"err", err,
 			"url", url,
-			"body", buf.String(),
+			"request", req,
 		)
 		return ""
 	}
@@ -182,7 +194,7 @@ func getIP(ctx context.Context) string {
 			"http request failed",
 			"err", err,
 			"url", url,
-			"body", buf.String(),
+			"request", req,
 		)
 		return ""
 	}
@@ -249,7 +261,7 @@ func getID(ctx context.Context) (id, ip string) {
 			"Failed to generate http request",
 			"err", err,
 			"url", url,
-			"body", buf.String(),
+			"request", req,
 		)
 		return "", ""
 	}
@@ -261,7 +273,7 @@ func getID(ctx context.Context) (id, ip string) {
 			"http request failed",
 			"err", err,
 			"url", url,
-			"body", buf.String(),
+			"request", req,
 		)
 		return "", ""
 	}
