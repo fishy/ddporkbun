@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/netip"
 	"os"
 	"strconv"
 	"strings"
@@ -55,7 +56,12 @@ var (
 	ip = flag.String(
 		"ip",
 		"",
-		"The IPv4 ip for the A record (leave empty to use your current IP)",
+		"The IPv4 ip for the A record (leave empty to use your current IP via Porkbun API)",
+	)
+	unifiAPIKey = flag.String(
+		"unifi-apikey",
+		"",
+		"When set and ip is unset, get the IP from unifi API instead of Porkbun API",
 	)
 	ttl = flag.Duration(
 		"ttl",
@@ -105,6 +111,8 @@ func main() {
 	slog.DebugContext(ctx, "auth successful", "ip", content)
 	if *ip != "" {
 		content = *ip
+	} else if *unifiAPIKey != "" {
+		content = getIPFromUnifi(ctx, *unifiAPIKey)
 	}
 	id, prevContent := getID(ctx)
 	if prevContent == content {
@@ -476,4 +484,92 @@ func create(ctx context.Context, content string) {
 		return
 	}
 	slog.DebugContext(ctx, "created record", "url", url, "response", body, "decoded", data)
+}
+
+var zeroV4 [4]byte
+
+func isPublicV4IP(ip netip.Addr) bool {
+	if !ip.Is4() {
+		return false
+	}
+	if ip.IsPrivate() {
+		return false
+	}
+	if ip.IsUnspecified() {
+		return false
+	}
+	if ip.As4() == zeroV4 {
+		return false
+	}
+	return true
+}
+
+func getIPFromUnifi(ctx context.Context, apikey string) string {
+	const endpoint = "https://api.ui.com/v1/hosts"
+
+	ctx, cancel := context.WithTimeout(ctx, *timeout)
+	defer cancel()
+
+	r, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		fatal(ctx, "failed to create unifi api request", "err", err)
+		return ""
+	}
+	r.Header.Set("X-API-Key", apikey)
+	r.Header.Set("Accept", "application/json")
+	resp, err := client.Do(r)
+	if err != nil {
+		fatal(ctx, "unifi api http request failed", "err", err)
+		return ""
+	}
+	var data struct {
+		Data []struct {
+			ReportedState struct {
+				IP netip.Addr `json:"ip"`
+			} `json:"reportedState"`
+		} `json:"data"`
+	}
+	body, err := decodeBody(resp, &data)
+	if err != nil {
+		fatal(
+			ctx,
+			"Failed to decode unifi response body",
+			"err", err,
+			"code", resp.StatusCode,
+			"body", body,
+		)
+		return ""
+	}
+	if len(data.Data) == 0 {
+		fatal(ctx, "No data in unifi api response", "body", body)
+		return ""
+	}
+	if len(data.Data) > 1 {
+		slog.WarnContext(
+			ctx,
+			"More than one data in unifi api response",
+			"data", data,
+		)
+	}
+	// Find the first public v4 address
+	for i := range data.Data {
+		ip := data.Data[i].ReportedState.IP.Unmap()
+		if !isPublicV4IP(ip) {
+			continue
+		}
+		slog.DebugContext(
+			ctx,
+			"Found public v4 ip from unifi response",
+			"i", i,
+			"ip", ip,
+			"body", body,
+		)
+		return netip.AddrFrom4(ip.As4()).String()
+	}
+	fatal(
+		ctx,
+		"No public v4 ip from unifi response found",
+		"data", data,
+	)
+	return ""
 }
