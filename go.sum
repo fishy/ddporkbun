@@ -1,0 +1,4 @@
+go.yhsif.com/ctxslog v1.1.0 h1:r0rHL70Vjy4NVeITRUwtBCgt6CHY+QchXOGi7Wuf3j8=
+go.yhsif.com/ctxslog v1.1.0/go.mod h1:xFOd7LrNvPlOvpmFKDwLWwXQnNRnnabeuzx2+bBcp4A=
+go.yhsif.com/flagutils v0.2.0 h1:MVPdEZOTctSDd8fQ6CCeLlYTCneMY6pbGl1MWF9aJPc=
+go.yhsif.com/flagutils v0.2.0/go.mod h1:8ESSA1knO8Cqf5ugbFCZVFwg4qA6/rqwosc+M1aFWRk=

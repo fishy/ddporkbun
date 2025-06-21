@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/netip"
 	"os"
@@ -15,11 +16,15 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"go.yhsif.com/ctxslog"
+	"go.yhsif.com/flagutils"
 )
 
 const (
-	success    = "SUCCESS"
-	recordType = "A"
+	success      = "SUCCESS"
+	v4RecordType = "A"
+	v6RecordType = "AAAA"
 )
 
 var client http.Client
@@ -28,9 +33,17 @@ var client http.Client
 var (
 	level slog.Level
 
-	endpoint = flag.String(
+	v4 = flagutils.OneOf{Bool: true}
+	v6 = flagutils.OneOf{Bool: false}
+
+	v4Endpoint = flag.String(
 		"endpoint",
 		"https://api-ipv4.porkbun.com/api/json/v3",
+		"Porkbun IPv4 API endpoint",
+	)
+	v6Endpoint = flag.String(
+		"v6-endpoint",
+		"https://api.porkbun.com/api/json/v3",
 		"Porkbun API endpoint",
 	)
 	apiKey = flag.String(
@@ -56,12 +69,17 @@ var (
 	ip = flag.String(
 		"ip",
 		"",
-		"The IPv4 ip for the A record (leave empty to use your current IP via Porkbun API)",
+		"The ip to set (leave empty to figure out your current IP via APIs)",
+	)
+	v6LocalIP = flag.Bool(
+		"local-ipv6",
+		true,
+		"When set with ipv6 set and ip is unset, get the first public IPv6 from local network interfaces instead of using APIs",
 	)
 	unifiAPIKey = flag.String(
 		"unifi-apikey",
 		"",
-		"When set and ip is unset, get the IP from unifi API instead of Porkbun API",
+		"When set with ipv4 set and ip is unset, get the IP from unifi API instead of Porkbun API",
 	)
 	ttl = flag.Duration(
 		"ttl",
@@ -86,37 +104,62 @@ type request struct {
 	TTL       string `json:"ttl,omitempty"`
 }
 
+func redactSecKey(groups []string, a slog.Attr) slog.Attr {
+	if req, ok := a.Value.Any().(request); ok {
+		req.SecKey = "*REDACTED*"
+
+		var sb strings.Builder
+		if err := json.NewEncoder(&sb).Encode(req); err == nil {
+			a.Value = slog.StringValue(sb.String())
+		}
+	}
+	return a
+}
+
 func main() {
+	flag.Var(&v4, "ipv4", "Set ipv4 ip (A record), unsets ipv6")
+	flag.Var(&v6, "ipv6", "Set ipv6 ip (AAAA record), unsets ipv4")
+	flagutils.GroupOneOf(&v4, &v6)
 	flag.TextVar(&level, "log-level", &level, "minimal log level to keep")
 	flag.Parse()
 
-	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
-		AddSource: true,
-		Level:     &level,
-		ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
-			if req, ok := a.Value.Any().(request); ok {
-				req.SecKey = "*REDACTED*"
-
-				var sb strings.Builder
-				if err := json.NewEncoder(&sb).Encode(req); err == nil {
-					a.Value = slog.StringValue(sb.String())
-				}
-			}
-			return a
-		},
-	})))
+	slog.SetDefault(ctxslog.New(
+		ctxslog.WithText,
+		ctxslog.WithAddSource(true),
+		ctxslog.WithLevel(&level),
+		ctxslog.WithReplaceAttr(ctxslog.ChainReplaceAttr(
+			redactSecKey,
+		)),
+	))
 
 	ctx := context.Background()
+	switch {
+	default:
+		ctx = ctxslog.Attach(ctx, slog.Bool("ipv4", true))
+	case v6.Bool:
+		ctx = ctxslog.Attach(ctx, slog.Bool("ipv6", true))
+	}
 	content := getIP(ctx)
 	slog.DebugContext(ctx, "auth successful", "ip", content)
 	if *ip != "" {
 		content = *ip
-	} else if *unifiAPIKey != "" {
-		content = getIPFromUnifi(ctx, *unifiAPIKey)
+	} else {
+		switch {
+		default:
+			if *unifiAPIKey != "" {
+				content = getIPFromUnifi(ctx, *unifiAPIKey)
+			}
+
+		case v6.Bool:
+			if *v6LocalIP {
+				content = getFirstPublicIPv6(ctx)
+			}
+		}
 	}
+	doubleCheckIP(ctx, content)
 	id, prevContent := getID(ctx)
 	if prevContent == content {
-		slog.InfoContext(ctx, "same ip, skipping...")
+		slog.InfoContext(ctx, "same ip, skipping...", "ip", content)
 		return
 	}
 	if id != "" {
@@ -161,6 +204,26 @@ func decodeBody(resp *http.Response, data any) (string, error) {
 	return buf.String(), err
 }
 
+func getPorkbunEndpoint() string {
+	switch {
+	default:
+		return *v4Endpoint
+
+	case v6.Bool:
+		return *v6Endpoint
+	}
+}
+
+func getRecordType() string {
+	switch {
+	default:
+		return v4RecordType
+
+	case v6.Bool:
+		return v6RecordType
+	}
+}
+
 func getIP(ctx context.Context) string {
 	ctx, cancel := context.WithTimeout(ctx, *timeout)
 	defer cancel()
@@ -182,7 +245,7 @@ func getIP(ctx context.Context) string {
 		return ""
 	}
 
-	url := *endpoint + "/ping"
+	url := getPorkbunEndpoint() + "/ping"
 	r, err := http.NewRequestWithContext(ctx, http.MethodPost, url, buf)
 	if err != nil {
 		fatal(
@@ -258,7 +321,7 @@ func getID(ctx context.Context) (id, ip string) {
 		return "", ""
 	}
 
-	url := fmt.Sprintf("%s/dns/retrieveByNameType/%s/%s/", *endpoint, *domain, recordType)
+	url := fmt.Sprintf("%s/dns/retrieveByNameType/%s/%s/", getPorkbunEndpoint(), *domain, getRecordType())
 	if *subdomain != "" {
 		url += *subdomain
 	}
@@ -308,7 +371,7 @@ func getID(ctx context.Context) (id, ip string) {
 	if data.Status != success {
 		fatal(
 			ctx,
-			"Ping failed",
+			"Failed to get existing records",
 			"url", url,
 			"code", resp.StatusCode,
 			"status", data.Status,
@@ -338,7 +401,7 @@ func updateOrCreateRequest(content string) request {
 		SecKey: *secKey,
 
 		Subdomain: *subdomain,
-		Type:      recordType,
+		Type:      getRecordType(),
 		Content:   content,
 		TTL:       strconv.FormatInt(int64(ttl.Seconds()), 10),
 	}
@@ -362,7 +425,7 @@ func update(ctx context.Context, id string, content string) {
 		return
 	}
 
-	url := fmt.Sprintf("%s/dns/edit/%s/%s", *endpoint, *domain, id)
+	url := fmt.Sprintf("%s/dns/edit/%s/%s", getPorkbunEndpoint(), *domain, id)
 	r, err := http.NewRequestWithContext(ctx, http.MethodPost, url, buf)
 	if err != nil {
 		fatal(
@@ -404,7 +467,7 @@ func update(ctx context.Context, id string, content string) {
 	if data.Status != success {
 		fatal(
 			ctx,
-			"Ping failed",
+			"Failed to update existing record",
 			"url", url,
 			"code", resp.StatusCode,
 			"status", data.Status,
@@ -433,7 +496,7 @@ func create(ctx context.Context, content string) {
 		return
 	}
 
-	url := fmt.Sprintf("%s/dns/create/%s", *endpoint, *domain)
+	url := fmt.Sprintf("%s/dns/create/%s", getPorkbunEndpoint(), *domain)
 	r, err := http.NewRequestWithContext(ctx, http.MethodPost, url, buf)
 	if err != nil {
 		fatal(
@@ -475,7 +538,7 @@ func create(ctx context.Context, content string) {
 	if data.Status != success {
 		fatal(
 			ctx,
-			"Ping failed",
+			"Failed to create record",
 			"url", url,
 			"code", resp.StatusCode,
 			"status", data.Status,
@@ -488,20 +551,17 @@ func create(ctx context.Context, content string) {
 
 var zeroV4 [4]byte
 
-func isPublicV4IP(ip netip.Addr) bool {
+func isPublicIPv4(ctx context.Context, ip netip.Addr) bool {
+	ctx = ctxslog.Attach(ctx, "ip", ip)
 	if !ip.Is4() {
-		return false
-	}
-	if ip.IsPrivate() {
-		return false
-	}
-	if ip.IsUnspecified() {
+		slog.DebugContext(ctx, "Skipping non-4")
 		return false
 	}
 	if ip.As4() == zeroV4 {
+		slog.DebugContext(ctx, "Skipping zero")
 		return false
 	}
-	return true
+	return isPublicIP(ctx, ip)
 }
 
 func getIPFromUnifi(ctx context.Context, apikey string) string {
@@ -553,18 +613,9 @@ func getIPFromUnifi(ctx context.Context, apikey string) string {
 	}
 	// Find the first public v4 address
 	for i := range data.Data {
-		ip := data.Data[i].ReportedState.IP.Unmap()
-		if !isPublicV4IP(ip) {
-			continue
+		if ip := data.Data[i].ReportedState.IP.Unmap(); isPublicIPv4(ctx, ip) {
+			return netip.AddrFrom4(ip.As4()).String()
 		}
-		slog.DebugContext(
-			ctx,
-			"Found public v4 ip from unifi response",
-			"i", i,
-			"ip", ip,
-			"body", body,
-		)
-		return netip.AddrFrom4(ip.As4()).String()
 	}
 	fatal(
 		ctx,
@@ -572,4 +623,107 @@ func getIPFromUnifi(ctx context.Context, apikey string) string {
 		"data", data,
 	)
 	return ""
+}
+
+func getFirstPublicIPv6(ctx context.Context) string {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		fatal(ctx, "Failed to get local network interfaces", "err", err)
+	}
+	slog.DebugContext(ctx, "Got interfaces", "interfaces", ifaces)
+	for _, iface := range ifaces {
+		ctx := ctxslog.Attach(context.Background(), slog.Any("iface", iface))
+		slog.DebugContext(ctx, "Got interface")
+		if iface.Flags&net.FlagLoopback != 0 {
+			slog.DebugContext(ctx, "Skipping loopback interface")
+			continue
+		}
+		if iface.Flags&net.FlagRunning == 0 {
+			slog.DebugContext(ctx, "Skipping not running interface")
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			slog.ErrorContext(ctx, "Can't get addresses", "err", err)
+			continue
+		}
+		for _, addr := range addrs {
+			prefix, err := netip.ParsePrefix(addr.String())
+			if err != nil {
+				slog.ErrorContext(ctx, "Can't parse address", "err", err, "addr", addr)
+				continue
+			}
+			if ip := prefix.Addr(); isPublicIPv6(ctx, ip) {
+				return ip.String()
+			}
+		}
+	}
+	fatal(ctx, "No public v6 ip found from local interfaces")
+	return ""
+}
+
+func isPublicIP(ctx context.Context, ip netip.Addr) bool {
+	if !ip.IsValid() {
+		slog.WarnContext(ctx, "Skipping invalid")
+		return false
+	}
+	if ip.IsLoopback() {
+		slog.DebugContext(ctx, "Skipping loopback")
+		return false
+	}
+	if ip.IsPrivate() {
+		slog.DebugContext(ctx, "Skipping private")
+		return false
+	}
+	if ip.IsUnspecified() {
+		slog.DebugContext(ctx, "Skipping unspecifid")
+		return false
+	}
+	if ip.IsLinkLocalMulticast() {
+		slog.DebugContext(ctx, "Skipping link local multicast")
+		return false
+	}
+	if ip.IsLinkLocalUnicast() {
+		slog.DebugContext(ctx, "Skipping link local unicast")
+		return false
+	}
+	slog.DebugContext(ctx, "Found public ip")
+	return true
+}
+
+var zeroV6 [16]byte
+
+func isPublicIPv6(ctx context.Context, ip netip.Addr) bool {
+	ctx = ctxslog.Attach(ctx, slog.Any("ip", ip))
+	if !ip.Is6() {
+		slog.DebugContext(ctx, "Skipping non-6")
+		return false
+	}
+	if ip.Is4In6() {
+		slog.DebugContext(ctx, "Skipping 4-in-6")
+		return false
+	}
+	if ip.As16() == zeroV6 {
+		slog.DebugContext(ctx, "Skipping zero")
+		return false
+	}
+	return isPublicIP(ctx, ip)
+}
+
+func doubleCheckIP(ctx context.Context, ip string) {
+	addr, err := netip.ParseAddr(ip)
+	if err != nil {
+		fatal(ctx, "Failed to parse contet as ip", "err", err, "content", ip)
+	}
+	switch {
+	default:
+		if !addr.Is4() {
+			fatal(ctx, "Trying to set non-v4 ip", "ip", ip, "recordType", getRecordType())
+		}
+
+	case v6.Bool:
+		if !addr.Is6() {
+			fatal(ctx, "Trying to set non-v6 ip", "ip", ip, "recordType", getRecordType())
+		}
+	}
 }
