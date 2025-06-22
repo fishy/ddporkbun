@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -8,10 +9,12 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net"
 	"net/http"
 	"net/netip"
 	"os"
+	"os/exec"
+	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -74,7 +77,7 @@ var (
 	v6LocalIP = flag.Bool(
 		"local-ipv6",
 		true,
-		"When set with ipv6 set and ip is unset, get the first public IPv6 from local network interfaces instead of using APIs",
+		"When set with ipv6 set and ip is unset, get the first public IPv6 from local network interfaces instead of using APIs (NOTE: requires `ip addr` command to be available",
 	)
 	unifiAPIKey = flag.String(
 		"unifi-apikey",
@@ -625,40 +628,49 @@ func getIPFromUnifi(ctx context.Context, apikey string) string {
 	return ""
 }
 
+// With IPv6 SLAAC privacy, we could have multiple public IPv6 addresses, with
+// one of them being "permenant" and others being "temporary" or "deprecated".
+// But in Go there's no way to tell them apart
+// (https://github.com/golang/go/issues/42694), so instead we just parse the
+// output of `ip addr` with regular expression instead (https://xkcd.com/208/).
+//
+// Example line:
+//
+//	inet6 1234:1234::1234/64 scope global temporary dynamic
+var ipv6RE = regexp.MustCompile(`inet6 ([0-9a-f:]*)/[0-9]* scope (.*)`)
+
 func getFirstPublicIPv6(ctx context.Context) string {
-	ifaces, err := net.Interfaces()
+	cmd := exec.CommandContext(ctx, "ip", "addr")
+	output, err := cmd.Output()
 	if err != nil {
-		fatal(ctx, "Failed to get local network interfaces", "err", err)
+		fatal(ctx, "Failed to run `ip addr`", "err", err)
 	}
-	slog.DebugContext(ctx, "Got interfaces", "interfaces", ifaces)
-	for _, iface := range ifaces {
-		ctx := ctxslog.Attach(context.Background(), slog.Any("iface", iface))
-		slog.DebugContext(ctx, "Got interface")
-		if iface.Flags&net.FlagLoopback != 0 {
-			slog.DebugContext(ctx, "Skipping loopback interface")
+	scanner := bufio.NewScanner(bytes.NewReader(output))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		groups := ipv6RE.FindStringSubmatch(line)
+		if len(groups) == 0 {
+			slog.DebugContext(ctx, "Skipping line", "line", line)
 			continue
 		}
-		if iface.Flags&net.FlagRunning == 0 {
-			slog.DebugContext(ctx, "Skipping not running interface")
+		ipStr := groups[1]
+		scopes := strings.Fields(groups[2])
+		slog.DebugContext(ctx, "Matched line", "ip", ipStr, "scopes", scopes, "line", line)
+		if !slices.Contains(scopes, "global") || slices.Contains(scopes, "temporary") || slices.Contains(scopes, "deprecated") {
+			// We only want global ipv6 without temporary or deprecated scopes
+			slog.DebugContext(ctx, "Skipping by scopes", "scopes", scopes)
 			continue
 		}
-		addrs, err := iface.Addrs()
+		ip, err := netip.ParseAddr(ipStr)
 		if err != nil {
-			slog.ErrorContext(ctx, "Can't get addresses", "err", err)
+			slog.WarnContext(ctx, "Failed to parse IP", "err", err, "ip", ipStr)
 			continue
 		}
-		for _, addr := range addrs {
-			prefix, err := netip.ParsePrefix(addr.String())
-			if err != nil {
-				slog.ErrorContext(ctx, "Can't parse address", "err", err, "addr", addr)
-				continue
-			}
-			if ip := prefix.Addr(); isPublicIPv6(ctx, ip) {
-				return ip.String()
-			}
+		if isPublicIPv6(ctx, ip) {
+			return ip.String()
 		}
 	}
-	fatal(ctx, "No public v6 ip found from local interfaces")
+	fatal(ctx, "No public ipv6 found from `ip addr`")
 	return ""
 }
 
