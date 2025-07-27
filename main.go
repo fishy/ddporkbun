@@ -8,6 +8,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"iter"
 	"log/slog"
 	"net/http"
 	"net/netip"
@@ -84,6 +85,11 @@ var (
 		"",
 		"When set with ipv4 set and ip is unset, get the IP from unifi API instead of Porkbun API",
 	)
+	unifiSiteName = flag.String(
+		"unifi-site-name",
+		"",
+		"In case you have multiple sites in your unifi account, specify the site name here. If empty we use the first site.",
+	)
 	ttl = flag.Duration(
 		"ttl",
 		10*time.Minute, // NOTE: this is the current minimal TTL allowed by Porkbun
@@ -150,12 +156,14 @@ func main() {
 		switch {
 		default:
 			if *unifiAPIKey != "" {
-				content = getIPFromUnifi(ctx, *unifiAPIKey)
+				content = getIPFromUnifi(ctx, *unifiAPIKey, *unifiSiteName, isPublicIPv4)
 			}
 
 		case v6.Bool:
 			if *v6LocalIP {
 				content = getFirstPublicIPv6(ctx)
+			} else if *unifiAPIKey != "" {
+				content = getIPFromUnifi(ctx, *unifiAPIKey, *unifiSiteName, isPublicIPv6)
 			}
 		}
 	}
@@ -567,7 +575,51 @@ func isPublicIPv4(ctx context.Context, ip netip.Addr) bool {
 	return isPublicIP(ctx, ip)
 }
 
-func getIPFromUnifi(ctx context.Context, apikey string) string {
+type unifiSite struct {
+	ReportedState struct {
+		IP   netip.Addr   `json:"ip"`
+		IPs  []netip.Addr `json:"ipAddrs"`
+		Name string       `json:"name"`
+	} `json:"reportedState"`
+}
+
+func (s unifiSite) ips() iter.Seq[netip.Addr] {
+	return func(yield func(netip.Addr) bool) {
+		if !yield(s.ReportedState.IP) {
+			return
+		}
+		for _, ip := range s.ReportedState.IPs {
+			if !yield(ip) {
+				return
+			}
+		}
+	}
+}
+
+type unifiResponse struct {
+	Data []unifiSite `json:"data"`
+}
+
+func (r unifiResponse) siteByName(name string) unifiSite {
+	if name == "" && len(r.Data) > 0 {
+		if len(r.Data) > 1 {
+			slog.Warn(
+				"More than one site in unifi api response",
+				"data", r,
+			)
+		}
+		return r.Data[0]
+	}
+	name = strings.ToLower(name)
+	for _, site := range r.Data {
+		if strings.ToLower(site.ReportedState.Name) == name {
+			return site
+		}
+	}
+	return unifiSite{}
+}
+
+func getIPFromUnifi(ctx context.Context, apikey string, siteName string, predicate func(context.Context, netip.Addr) bool) string {
 	const endpoint = "https://api.ui.com/v1/hosts"
 
 	ctx, cancel := context.WithTimeout(ctx, *timeout)
@@ -585,13 +637,7 @@ func getIPFromUnifi(ctx context.Context, apikey string) string {
 		fatal(ctx, "unifi api http request failed", "err", err)
 		return ""
 	}
-	var data struct {
-		Data []struct {
-			ReportedState struct {
-				IP netip.Addr `json:"ip"`
-			} `json:"reportedState"`
-		} `json:"data"`
-	}
+	var data unifiResponse
 	body, err := decodeBody(resp, &data)
 	if err != nil {
 		fatal(
@@ -607,17 +653,11 @@ func getIPFromUnifi(ctx context.Context, apikey string) string {
 		fatal(ctx, "No data in unifi api response", "body", body)
 		return ""
 	}
-	if len(data.Data) > 1 {
-		slog.WarnContext(
-			ctx,
-			"More than one data in unifi api response",
-			"data", data,
-		)
-	}
+	site := data.siteByName(siteName)
 	// Find the first public v4 address
-	for i := range data.Data {
-		if ip := data.Data[i].ReportedState.IP.Unmap(); isPublicIPv4(ctx, ip) {
-			return netip.AddrFrom4(ip.As4()).String()
+	for ip := range site.ips() {
+		if ip := ip.Unmap(); predicate(ctx, ip) {
+			return ip.String()
 		}
 	}
 	fatal(
